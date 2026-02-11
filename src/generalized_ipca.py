@@ -564,61 +564,61 @@ class GIPCA:
 # Example usage and testing
 # =============================================================================
 if __name__ == "__main__":
+    from de_gipca import generate_gipca_data
+
     print("=" * 60)
-    print("GIPCA Test")
+    print("GIPCA Test (Soft GIPCA / Method B)")
     print("=" * 60)
 
-    # Generate synthetic data
-    np.random.seed(42)
+    # ── 1.  Synthetic data using generate_gipca_data  ────────
+    seed = 6890
+    np.random.seed(seed)
 
-    T = 100   # Time periods
-    N = 50    # Assets
-    L = 10    # Characteristics
-    K = 3     # Factors
-    R = 5     # Macro variables
+    num_assets = 40   # N
+    num_fact = 5      # K
+    num_charact = 25  # L
+    num_macro = 3     # R
+    win_len = 21      # T
+    max_iter = 500
+    include_intercept = False
+    alpha = 1.0
 
-    # True parameters
-    true_Gamma = np.random.randn(L, K)
-    true_Gamma, _ = np.linalg.qr(true_Gamma)
-    true_Gamma = true_Gamma[:, :K]
+    # Generate synthetic GIPCA data
+    data, truth = generate_gipca_data(
+        T=win_len,
+        N=num_assets,
+        m=num_charact,
+        k=num_fact,
+        num_macro=num_macro,
+        include_intercept=include_intercept,
+        seed=seed
+    )
 
-    true_Lambda = np.random.randn(R, K) * 0.5
+    # Extract ground truth
+    true_Gamma = truth['W_star']       # m × k
+    true_Delta = truth['Delta_star']   # k × num_macro
+    true_f0 = truth['f0']              # T × k
+    true_f_full = truth['f_full']      # T × k
 
-    # Generate macro variables (persistent)
-    M = np.cumsum(np.random.randn(T, R) * 0.1, axis=0)
-
-    # Generate factors: f_t = Lambda' m_t + noise
-    noise_f = np.random.randn(T, K) * 0.3
-    true_factors = M @ true_Lambda + noise_f  # T x K
-
-    # Generate characteristics
-    Z = np.random.randn(T, N, L) * 0.5
-    Z[:, :, 0] = 1  # Intercept
-
-    # Generate returns: r_{i,t} = c_{i,t}' Gamma f_t + noise
-    rets = np.zeros((T, N))
-    for t in range(T):
-        loadings = Z[t, :, :] @ true_Gamma  # N x K
-        rets[t, :] = loadings @ true_factors[t, :] + np.random.randn(N) * 0.5
-
-    # Fit GIPCA
-    print(f"\nData: T={T}, N={N}, L={L}, K={K}, R={R}")
-    print(f"Alpha = 1.0")
+    # ── 2.  Fit GIPCA  ───────────────────────────────────────
+    print(f"\nData: T={win_len}, N={num_assets}, L={num_charact}, "
+          f"K={num_fact}, R={num_macro}")
+    print(f"Alpha = {alpha}")
     print("-" * 60)
 
     model = GIPCA(
-        num_assets=N,
-        num_fact=K,
-        num_charact=L,
-        num_macro=R,
-        win_len=T,
-        alpha=1.0
+        num_assets=num_assets,
+        num_fact=num_fact,
+        num_charact=num_charact,
+        num_macro=num_macro,
+        win_len=win_len,
+        alpha=alpha
     )
 
-    data = [rets, Z, M]
-    Gamma_est, history = model.fit(data, max_iter=500, tol=1e-6, verbose=True, seed=42)
+    Gamma_est, history = model.fit(data, max_iter=max_iter, tol=1e-6,
+                                   verbose=True, seed=seed)
 
-    # Results
+    # ── 3.  Results  ─────────────────────────────────────────
     print("\n" + "=" * 60)
     print("Results")
     print("=" * 60)
@@ -635,22 +635,38 @@ if __name__ == "__main__":
     # Macro R² per factor
     macro_r2 = model.factor_macro_r2()
     print(f"Macro R² per factor: {np.round(macro_r2, 4)}")
+    print(f"Mean Macro R²: {np.mean(macro_r2):.4f}")
 
-    # Subspace comparison with true Gamma
+    # Subspace comparison (true W_star vs estimated Gamma)
     Q1, _ = np.linalg.qr(true_Gamma)
     Q2, _ = np.linalg.qr(Gamma_est)
     _, s, _ = np.linalg.svd(Q1.T @ Q2)
     principal_angles = np.arccos(np.clip(s, -1, 1))
 
-    print(f"\nSubspace comparison (True vs Estimated Gamma):")
-    print(f"  Principal angles (degrees): {np.round(np.degrees(principal_angles), 2)}")
-    print(f"  Grassmann distance: {np.linalg.norm(principal_angles):.4f}")
+    print(f"\nSubspace comparison (True W_star vs Estimated Γ):")
+    print(f"  Principal angles (°): {np.round(np.degrees(principal_angles), 2)}")
+    print(f"  Grassmann distance:   {np.linalg.norm(principal_angles):.4f}")
 
-    # Factor correlation
+    # Factor correlation (estimated vs true full factors)
     est_factors = results['factors'].values  # K x T
-    factor_corr = np.corrcoef(est_factors, true_factors.T)[:K, K:]
-    print(f"\nFactor correlations with true factors:")
+    factor_corr = np.corrcoef(est_factors, true_f_full.T)[:num_fact, num_fact:]
+    print(f"\n|Factor correlations| with true factors:")
     print(np.round(np.abs(factor_corr), 3))
+
+    # ── 4.  Ground truth comparison  ─────────────────────────
+    print("\n" + "=" * 60)
+    print("Ground Truth Comparison")
+    print("=" * 60)
+    print(f"\nTrue W_star (Gamma):\n{true_Gamma[:5, :]}  ... (first 5 rows)")
+    print(f"\nEstimated Gamma:\n{Gamma_est[:5, :]}  ... (first 5 rows)")
+    print(f"\nTrue Delta:\n{true_Delta}")
+    print(f"\nEstimated Lambda:\n{results['Lambda'].values}")
+
+    # ── 5.  Monotonicity check  ──────────────────────────────
+    diffs = np.diff(history)
+    n_increases = np.sum(diffs > 1e-10)
+    print(f"\nObjective monotonicity: "
+          f"{'PASS ✓' if n_increases == 0 else f'FAIL ✗ ({n_increases} increases)'}")
 
     print("\n" + "=" * 60)
     print("GIPCA test complete!")
