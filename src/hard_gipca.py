@@ -1,33 +1,29 @@
 """
-Hard Macro Factor Model (Method A) — Generalized Instrumented PCA
+ALS GIPCA — Generalized Instrumented PCA with Latent Factors
 
-Factors are fully determined by the macro state: f_t ≡ Λ' m_t.
-No free/latent factors are estimated.
+Full model with latent factor residuals:
+    r_t = Z_t Γ f_t + ε_t
+    f_t = f⁰_t + Λ' m_t
 
-Objective (Method A from Missaoui & Lesniewski, 2026):
-    min_{Γ, Λ}  (1/N) Σ_t ‖x_t − Z_t Γ (Λ' m_t)‖²    s.t.  Γ'Γ = I_K
+where f⁰_t is a free/latent factor component estimated from data.
+
+Objective (profiled, no penalty):
+    min_{Γ, Λ, f}  (1/N) Σ_t ‖r_t − Z_t Γ f_t‖²    s.t.  Γ'Γ = I_K
 
 ALS alternates between:
-    Γ-step : Kronecker normal equations with g_t = Λ'm_t, SVD orthonormalization
-    Λ-step : Kronecker normal equations in the projected space (KR × KR system)
+    f-step : Cross-sectional OLS for each t: f_t = (Λ_t'Λ_t)⁻¹ Λ_t' r_t
+    Γ-step : Kronecker normal equations with f_t, SVD orthonormalization
+    Λ-step : Time-series OLS: regress f_t on m_t
 
 Intercept convention:
     The caller should prepend a column of ones to the macro matrix M so that
     Λ' m̃_t = λ₀ + Λ_macro' m_t.  All code below treats the intercept as an
     ordinary macro variable (the first column of M).
 
-Relation to soft GIPCA (Method B):
-    This is the α → ∞ limit of the soft objective.
-
-Λ-step derivation (projected Kronecker system)
------------------------------------------------
-With Γ fixed, define Ã_t = Z_tΓ (N×K), P_t = Γ'W_tΓ (K×K), q_t = Γ'X_t (K).
-The row-major vectorisation θ = vec_C(Λ') ∈ ℝ^{KR} satisfies:
-
-    [Σ_t n_t · kron(P_t, m_t m_t')] θ = Σ_t n_t · kron(q_t, m_t)
-
-where kron is np.kron (row-major Kronecker).
-After solving, Λ = reshape(θ, K, R).T gives R × K.
+Relation to other methods:
+    - Hard GIPCA (α → ∞): Forces f⁰_t = 0, so f_t = Λ' m_t exactly
+    - Soft GIPCA (finite α): Penalizes ||f_t - Λ' m_t||² with weight α
+    - This version (α = 0): No penalty, f⁰_t is free
 """
 
 import numpy as np
@@ -38,10 +34,10 @@ from typing import Dict, Tuple, Optional
 
 class HardGIPCA:
     """
-    Hard Macro Factor Model (Method A).
+    ALS GIPCA with Latent Factors.
 
-    Factors are fully determined by the macro state: f_t = Λ' m_t.
-    No free/latent factor time series is estimated.
+    Full model: f_t = f⁰_t + Λ' m_t, where f⁰_t is a free latent component.
+    Estimates Γ, Λ, and the full factor series f_t via ALS.
 
     Parameters
     ----------
@@ -69,8 +65,9 @@ class HardGIPCA:
         self.ridge = ridge
 
         # Parameters to be estimated
-        self.Gamma = None   # L × K  (DataFrame)
-        self.Lambda = None  # R × K  (DataFrame)
+        self.Gamma = None    # L × K  (DataFrame)
+        self.Lambda = None   # R × K  (DataFrame)
+        self.factors = None  # K × T  (DataFrame) — full factors f_t
 
         self._fitted = False
         self.objective_history = []
@@ -79,15 +76,15 @@ class HardGIPCA:
     # ──────────────────────────────────────────────────────────
     #  Loss function
     # ──────────────────────────────────────────────────────────
-    def loss_fct(self, Gamma: np.ndarray, Lambda: np.ndarray,
+    def loss_fct(self, Gamma: np.ndarray, factors: np.ndarray,
                  data: list) -> float:
         """
-        Hard GIPCA loss:  (1/N) Σ_t ‖x_t − Z_t Γ (Λ' m_t)‖².
+        GIPCA loss with explicit factors:  (1/T) Σ_t ‖r_t − Z_t Γ f_t‖².
 
         Parameters
         ----------
         Gamma : np.ndarray (L × K)
-        Lambda : np.ndarray (R × K)
+        factors : np.ndarray (K × T)
         data : list  [rets (T,N), Z (T,N,L), M (T,R)]
 
         Returns
@@ -95,34 +92,41 @@ class HardGIPCA:
         float
         """
         rets, Z, M = data
-        T, N = rets.shape
+        T, _ = rets.shape
 
         obj = 0.0
         for t in range(T):
-            g_t = Lambda.T @ M[t, :]                 # K
-            pred = Z[t, :, :] @ Gamma @ g_t           # N
+            f_t = factors[:, t]                       # K
+            pred = Z[t, :, :] @ Gamma @ f_t           # N
             obj += np.sum((rets[t, :] - pred) ** 2)
 
-        return obj / N
+        return obj / T
 
     # ──────────────────────────────────────────────────────────
     #  Fit via ALS
     # ──────────────────────────────────────────────────────────
-    def fit(self, data: list, max_iter: int = 1000, tol: float = 1e-6,
-            verbose: bool = True, seed: int = None
+    def fit(self, data: list, max_iter: int = 1000, min_iter: int = 100,
+            tol: float = 1e-6, verbose: bool = True, seed: int = None,
+            init_Gamma: np.ndarray = None
             ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Fit the Hard GIPCA model via ALS (Γ-step, Λ-step).
+        Fit the GIPCA model via ALS (f-step, Γ-step, Λ-step).
 
         Parameters
         ----------
         data : list
             [rets (T,N), Z (T,N,L), M (T,R)]
         max_iter : int
+            Maximum number of iterations.
+        min_iter : int
+            Minimum iterations before convergence check (default 100).
         tol : float
-            Convergence tolerance (max absolute parameter change).
+            Convergence tolerance (relative objective change).
         verbose : bool
         seed : int, optional
+        init_Gamma : np.ndarray (L × K), optional
+            Initial Gamma matrix. If provided, skips best-of-population search.
+            Must be orthonormal (Γ'Γ = I_K).
 
         Returns
         -------
@@ -161,51 +165,90 @@ class HardGIPCA:
         self.objective_history = []
 
         # ── Initialise ──
-        Gamma_old, Lambda_old = self._initialize(seed=seed)
+        if init_Gamma is not None:
+            # Use provided initialization
+            Gamma_arr = np.asarray(init_Gamma)
+            assert Gamma_arr.shape == (self.L, self.K), \
+                f"init_Gamma shape {Gamma_arr.shape} != expected {(self.L, self.K)}"
+            Gamma_old = pd.DataFrame(Gamma_arr,
+                                     index=self.char_names, columns=self.factor_names)
+            factors_old = self._update_factors(Gamma_old)
+            Lambda_old = self._update_lambda(factors_old)
+            if verbose:
+                print("Using provided init_Gamma")
+        else:
+            # Best-of-population search
+            Gamma_old, Lambda_old, factors_old = self._initialize(seed=seed)
 
-        obj_init = self._compute_objective(Gamma_old, Lambda_old)
+        obj_init = self._compute_objective(Gamma_old, factors_old)
         self.objective_history.append(obj_init)
         if verbose:
             print(f"Iteration    0: Objective = {obj_init:.6f}")
 
         # ── ALS loop ──
+        obj_old = obj_init
         for iteration in range(max_iter):
-            # Step 1 — Γ-step:  update Gamma given Lambda
-            Gamma_new = self._update_gamma(Lambda_old)
+            # Step 1 — f-step: update factors given Gamma (cross-sectional OLS)
+            factors_new = self._update_factors(Gamma_old)
 
-            # Step 2 — Λ-step:  update Lambda given Gamma
-            Lambda_new = self._update_lambda(Gamma_new)
+            # Step 2 — Γ-step: update Gamma given factors (with Procrustes alignment)
+            Gamma_new = self._update_gamma(factors_new, Gamma_old=Gamma_old)
+
+            # Step 3 — Λ-step: update Lambda given factors (time-series OLS)
+            Lambda_new = self._update_lambda(factors_new)
 
             # Objective
-            obj = self._compute_objective(Gamma_new, Lambda_new)
+            obj = self._compute_objective(Gamma_new, factors_new)
             self.objective_history.append(obj)
 
-            # Convergence
+            # Convergence: use RELATIVE objective change
+            obj_change = abs(obj_old - obj) / (abs(obj_old) + 1e-10)
+
+            # Also track parameter change for diagnostics
             gamma_change = np.max(np.abs(Gamma_new.values - Gamma_old.values))
-            lambda_change = np.max(np.abs(Lambda_new.values - Lambda_old.values))
-            max_change = max(gamma_change, lambda_change)
+            factor_change = np.max(np.abs(factors_new.values - factors_old.values))
+            max_change = max(gamma_change, factor_change)
 
             if verbose and (iteration + 1) % 10 == 0:
                 print(f"Iteration {iteration + 1:4d}: Objective = {obj:.6f}, "
-                      f"Max change = {max_change:.2e}")
+                      f"Obj change = {obj_change:.2e}, Param change = {max_change:.2e}")
 
-            if max_change < tol:
+            # Check convergence (only after min_iter iterations)
+            if iteration + 1 >= min_iter and obj_change < tol:
                 if verbose:
                     print(f"\nConverged after {iteration + 1} iterations")
-                    print(f"Initial objective: {self.objective_history[0]:.6f}")
-                    print(f"Final objective:   {obj:.6f}")
-                    print(f"Reduction:         "
-                          f"{(1 - obj / self.objective_history[0]) * 100:.2f}%")
                 break
 
             Gamma_old = Gamma_new
             Lambda_old = Lambda_new
+            factors_old = factors_new
+            obj_old = obj
+
+        # ── Final summary ──
+        if verbose and iteration == max_iter - 1:
+            print(f"\nCompleted {max_iter} iterations (did not converge)")
+        if verbose:
+            print(f"Initial objective: {self.objective_history[0]:.6f}")
+            print(f"Final objective:   {obj:.6f}")
+            print(f"Reduction:         "
+                  f"{(1 - obj / self.objective_history[0]) * 100:.2f}%")
 
         # ── Store results ──
         self.Gamma = Gamma_new
         self.Lambda = Lambda_new
+        self.factors = factors_new
         self._fitted = True
         self.n_iterations = iteration + 1
+
+        # ── Identification: decompose f = Delta*mu + f0, check f0'mu = 0 ──
+        f0, Delta = self._decompose_factors(factors_new, Lambda_new)
+        self.f0 = f0          # K × T  (residual factors)
+        self.Delta = Delta    # K × R  (macro loading)
+
+        # Identification check: || f0^T @ mu || should be ~0
+        ident_norm = np.linalg.norm(f0 @ self._macro)  # f0 is K×T, mu is T×R
+        if verbose:
+            print(f"Identification check: || f0^T @ mu || = {ident_norm:.2e}")
 
         return self.Gamma.values, np.array(self.objective_history)
 
@@ -232,92 +275,157 @@ class HardGIPCA:
         return X, W, N_valid
 
     # ──────────────────────────────────────────────────────────
+    #  IPCA profiled loss (same as grassmanian_gipca_fully_identified)
+    # ──────────────────────────────────────────────────────────
+    def _ipca_profiled_loss(self, Gamma: np.ndarray) -> float:
+        """
+        IPCA profiled loss (same as GrassmannManifoldGIPCAEstimator.loss_fct):
+
+            L(Γ) = (1/T) Σ_t min_f ‖r_t − Z_t Γ f‖²
+
+        For each t, the factor f_t is profiled out via cross-sectional OLS.
+        """
+        rets, Z, _ = self._data
+
+        obj = 0.0
+        for t in range(self.T):
+            Lambda_t = Z[t] @ Gamma              # (N, K)
+            f_t, *_ = np.linalg.lstsq(Lambda_t, rets[t], rcond=None)
+            resid = rets[t] - Lambda_t @ f_t      # (N,)
+            obj += float(resid @ resid)
+
+        return obj / self.T
+
+    # ──────────────────────────────────────────────────────────
     #  Initialisation
     # ──────────────────────────────────────────────────────────
     def _initialize(self, seed=None):
         """
-        Best-of-population initialisation on the Grassmannian.
+        Best-of-population initialisation on the Grassmannian (aligned with de_gipca).
 
-        For each random Gamma candidate:
-          1.  Cross-sectional OLS → pseudo-factors f̂_t.
-          2.  Regress f̂_t on m_t → Lambda_cand.
-          3.  Evaluate the hard loss with g_t = Lambda_cand' m_t.
-        Keep the (Gamma, Lambda) pair with the lowest loss.
+        Generates pop_size random orthonormal Gamma matrices via QR decomposition,
+        evaluates the PROFILED LOSS (same as de_gipca) for each, and keeps the best.
+
+        This matches de_gipca's approach exactly:
+        - Same pop_size = 5 * L * K
+        - Same random initialization (uniform(-1, 1) then QR)
+        - Same loss function (profiled over Delta)
         """
-        if seed is not None:
-            np.random.seed(seed)
+        # Note: Does NOT reset the random seed here to match de_gipca's behavior,
+        # which uses the random state after data generation.
 
         dim = self.L * self.K
-        pop_size = min(5 * dim, 500)
+        pop_size = 5 * dim  # Same as de_gipca: pop_size = 5 * self.dim
 
         best_obj = np.inf
         best_Gamma = None
-        best_Lambda = None
-
-        M_sum = self._macro.T @ self._macro  # R × R
 
         for _ in range(pop_size):
-            # Random orthonormal Gamma
+            # Random orthonormal Gamma (same as de_gipca's population init)
             A = np.random.uniform(-1.0, 1.0, size=(self.L, self.K))
             Q, _ = np.linalg.qr(A)
             Gamma_cand = Q[:, :self.K]
 
-            # Cross-sectional pseudo-factors
-            factors_arr = np.zeros((self.K, self.T))
-            for t in range(self.T):
-                A_t = self._characteristics[t, :, :] @ Gamma_cand
-                factors_arr[:, t], *_ = np.linalg.lstsq(
-                    A_t, self._returns[t, :], rcond=None)
-
-            # OLS: Lambda = (M'M)^{-1} M' F'  where F is K × T
-            sum_fm = factors_arr @ self._macro          # K × R
-            Lambda_cand = sla.solve(
-                M_sum + 1e-8 * np.eye(self.R),
-                sum_fm.T, assume_a='sym')               # R × K
-
-            obj = self.loss_fct(Gamma_cand, Lambda_cand, self._data)
+            # Use PROFILED LOSS (same as de_gipca)
+            obj = self._ipca_profiled_loss(Gamma_cand)
             if obj < best_obj:
                 best_obj = obj
                 best_Gamma = Gamma_cand
-                best_Lambda = Lambda_cand
+
+        # Now compute factors and Lambda for the best Gamma
+        M_sum = self._macro.T @ self._macro  # R × R
+
+        factors_arr = np.zeros((self.K, self.T))
+        for t in range(self.T):
+            A_t = self._characteristics[t, :, :] @ best_Gamma
+            factors_arr[:, t], *_ = np.linalg.lstsq(
+                A_t, self._returns[t, :], rcond=None)
+
+        sum_fm = factors_arr @ self._macro          # K × R
+        Lambda_arr = sla.solve(
+            M_sum + 1e-8 * np.eye(self.R),
+            sum_fm.T, assume_a='sym')               # R × K
 
         Gamma = pd.DataFrame(best_Gamma,
                              index=self.char_names, columns=self.factor_names)
-        Lambda = pd.DataFrame(best_Lambda,
+        Lambda = pd.DataFrame(Lambda_arr,
                               index=self.macro_names, columns=self.factor_names)
-        return Gamma, Lambda
+        factors = pd.DataFrame(factors_arr,
+                               index=self.factor_names, columns=self.times)
+
+        print(f"Init IPCA profiled loss: {best_obj:.6f}")
+        return Gamma, Lambda, factors
 
     # ──────────────────────────────────────────────────────────
-    #  Γ-step  (Algorithm 1, lines 3-8)
+    #  Procrustes alignment (resolves rotation ambiguity)
     # ──────────────────────────────────────────────────────────
-    def _update_gamma(self, Lambda: pd.DataFrame) -> pd.DataFrame:
+    @staticmethod
+    def _procrustes_align(Gamma_new: np.ndarray, Gamma_old: np.ndarray) -> np.ndarray:
         """
-        Update Gamma given Lambda.
+        Align Gamma_new to Gamma_old via orthogonal Procrustes.
 
-        Uses macro-implied factors g_t = Λ' m_t.
+        Finds R = argmin_R ||Gamma_new @ R - Gamma_old||_F  s.t. R'R = I
+        Returns Gamma_new @ R.
+        """
+        # Solve Procrustes: R = V @ U' where Gamma_old' @ Gamma_new = U @ S @ V'
+        M = Gamma_old.T @ Gamma_new  # K × K
+        U, _, Vt = np.linalg.svd(M)
+        R = U @ Vt  # optimal rotation
+        return Gamma_new @ R
+
+    # ──────────────────────────────────────────────────────────
+    #  f-step: Update factors given Gamma (cross-sectional OLS)
+    # ──────────────────────────────────────────────────────────
+    def _update_factors(self, Gamma: pd.DataFrame) -> pd.DataFrame:
+        """
+        Update factors given Gamma via cross-sectional OLS for each t.
+
+        f_t = (Λ_t' Λ_t)^{-1} Λ_t' r_t  where Λ_t = Z_t @ Γ
+        """
+        Gamma_arr = Gamma.values  # L × K
+        factors_arr = np.zeros((self.K, self.T))
+
+        for t in self.times:
+            Z_t = self._characteristics[t, :, :]  # N × L
+            r_t = self._returns[t, :]              # N
+            Lambda_t = Z_t @ Gamma_arr             # N × K
+
+            # OLS: f_t = (Λ_t' Λ_t)^{-1} Λ_t' r_t
+            factors_arr[:, t], *_ = np.linalg.lstsq(Lambda_t, r_t, rcond=None)
+
+        return pd.DataFrame(factors_arr,
+                            index=self.factor_names, columns=self.times)
+
+    # ──────────────────────────────────────────────────────────
+    #  Γ-step: Update Gamma given factors
+    # ──────────────────────────────────────────────────────────
+    def _update_gamma(self, factors: pd.DataFrame,
+                      Gamma_old: pd.DataFrame = None) -> pd.DataFrame:
+        """
+        Update Gamma given factors.
 
         Row-major Kronecker normal equation (LK × LK):
-            [Σ_t n_t · kron(W_t, g_t g_t')] vec_C(Γ) = Σ_t n_t · kron(X_t, g_t)
+            [Σ_t n_t · kron(W_t, f_t f_t')] vec_C(Γ) = Σ_t n_t · kron(X_t, f_t)
 
         Then orthonormalise via SVD:  Γ_unc = UΔV' → Γ = UV'.
+        Finally, align with previous Gamma via Procrustes to avoid cycling.
         """
-        Lambda_arr = Lambda.values  # R × K
+        factors_arr = factors.values  # K × T
 
         vec_length = self.L * self.K
         numerator = np.zeros(vec_length)
         denominator = np.zeros((vec_length, vec_length))
 
         for t in self.times:
-            m_t = self._macro[t, :]             # R
-            g_t = Lambda_arr.T @ m_t            # K   (macro-implied factor)
+            f_t = factors_arr[:, t]             # K
 
             X_t = self._X[t].values             # L
             W_t = self._W[t].values             # L × L
             n_t = self._N_valid[t]
 
-            gg = np.outer(g_t, g_t)             # K × K
-            numerator += np.kron(X_t, g_t) * n_t
-            denominator += np.kron(W_t, gg) * n_t
+            ff = np.outer(f_t, f_t)             # K × K
+            numerator += np.kron(X_t, f_t) * n_t
+            denominator += np.kron(W_t, ff) * n_t
 
         # Regularise and solve
         denominator += self.ridge * np.eye(vec_length)
@@ -328,63 +436,74 @@ class HardGIPCA:
         U, _, Vt = np.linalg.svd(Gamma_unc, full_matrices=False)
         Gamma_arr = U @ Vt  # L × K  with  Γ'Γ = I_K
 
+        # Procrustes alignment to avoid rotation cycling
+        if Gamma_old is not None:
+            Gamma_arr = self._procrustes_align(Gamma_arr, Gamma_old.values)
+
         return pd.DataFrame(Gamma_arr,
                             index=self.char_names, columns=self.factor_names)
 
     # ──────────────────────────────────────────────────────────
-    #  Λ-step  (Algorithm 1, lines 9-12)
+    #  Λ-step: Update Lambda given factors (time-series OLS)
     # ──────────────────────────────────────────────────────────
-    def _update_lambda(self, Gamma: pd.DataFrame) -> pd.DataFrame:
+    def _update_lambda(self, factors: pd.DataFrame) -> pd.DataFrame:
         """
-        Update Lambda given Gamma.
+        Update Lambda given factors via time-series OLS.
 
-        Works in the K-dimensional projected space:
-            P_t = Γ' W_t Γ   (K×K)
-            q_t = Γ' X_t     (K)
+        Regress f_t on m_t:  Λ = (M'M)^{-1} M' F'
 
-        Row-major Kronecker normal equation (KR × KR):
-            [Σ_t n_t · kron(P_t, m_t m_t')  +  ridge · I] θ
-                = Σ_t n_t · kron(q_t, m_t)
-
-        where θ = vec_C(Λ') ∈ ℝ^{KR}.
-        After solving: Λ = reshape(θ, K, R).T   →  R × K.
+        where F is K × T (factors) and M is T × R (macro).
         """
-        Gamma_arr = Gamma.values  # L × K
+        factors_arr = factors.values  # K × T
 
-        system_dim = self.K * self.R
-        denominator = np.zeros((system_dim, system_dim))
-        numerator = np.zeros(system_dim)
-
-        for t in self.times:
-            m_t = self._macro[t, :]                # R
-            W_t = self._W[t].values                # L × L
-            X_t = self._X[t].values                # L
-            n_t = self._N_valid[t]
-
-            P_t = Gamma_arr.T @ W_t @ Gamma_arr   # K × K
-            q_t = Gamma_arr.T @ X_t               # K
-
-            mm = np.outer(m_t, m_t)                # R × R
-
-            denominator += np.kron(P_t, mm) * n_t
-            numerator += np.kron(q_t, m_t) * n_t
-
-        # Ridge regularisation
-        denominator += self.ridge * np.eye(system_dim)
-
-        # Solve and reshape
-        theta, *_ = np.linalg.lstsq(denominator, numerator, rcond=None)
-        Lambda_T = theta.reshape((self.K, self.R))  # K × R  =  Λ'
-        Lambda_arr = Lambda_T.T                      # R × K  =  Λ
+        # OLS: Λ = (M'M)^{-1} M' F'
+        # F @ M gives K × R, we want R × K
+        sum_fm = factors_arr @ self._macro          # K × R
+        Lambda_arr = sla.solve(
+            self._M_sum + self.ridge * np.eye(self.R),
+            sum_fm.T, assume_a='sym')               # R × K
 
         return pd.DataFrame(Lambda_arr,
                             index=self.macro_names, columns=self.factor_names)
 
     # ──────────────────────────────────────────────────────────
+    #  Identification: decompose factors into Delta*mu + f0
+    # ──────────────────────────────────────────────────────────
+    def _decompose_factors(self, factors: pd.DataFrame, Lambda: pd.DataFrame):
+        """
+        Decompose estimated factors into macro-explained and residual parts.
+
+        Given f_t and Lambda (= Delta in the GIPCA notation):
+            f0_t = f_t - Lambda' mu_t
+
+        By construction of the OLS Lambda-step, f0^T @ mu = 0 (identified).
+
+        Returns
+        -------
+        f0 : np.ndarray (K × T) — residual factors
+        Delta : np.ndarray (K × R) — macro loading (= Lambda^T)
+        """
+        factors_arr = factors.values       # K × T
+        Lambda_arr = Lambda.values         # R × K
+
+        # Macro-explained part: Lambda' @ mu_t for each t
+        # Lambda_arr is R × K, mu is T × R → mu @ Lambda_arr = T × K → transpose = K × T
+        macro_part = (self._macro @ Lambda_arr).T  # K × T
+
+        # Residual factors
+        f0 = factors_arr - macro_part  # K × T
+
+        # Delta = Lambda^T (K × R)
+        Delta = Lambda_arr.T
+
+        return f0, Delta
+
+    # ──────────────────────────────────────────────────────────
     #  Objective wrapper
     # ──────────────────────────────────────────────────────────
-    def _compute_objective(self, Gamma, Lambda):
-        return self.loss_fct(Gamma.values, Lambda.values, self._data)
+    def _compute_objective(self, Gamma, factors):
+        """Use profiled loss (same as de_gipca) for fair comparison."""
+        return self._ipca_profiled_loss(Gamma.values)
 
     # ──────────────────────────────────────────────────────────
     #  Predict
@@ -465,31 +584,68 @@ class HardGIPCA:
         if not self._fitted:
             raise ValueError("Model must be fitted first")
 
-        # Compute deterministic factor series
-        factors_arr = (self._macro @ self.Lambda.values).T  # K × T
-        factors = pd.DataFrame(factors_arr,
-                               index=self.factor_names, columns=self.times)
-
         return {
             'Gamma': self.Gamma,
             'Lambda': self.Lambda,
-            'factors': factors,
+            'factors': self.factors,  # Estimated factors (includes latent component)
             'objective_history': np.array(self.objective_history),
             'n_iterations': self.n_iterations,
         }
 
     # ──────────────────────────────────────────────────────────
-    #  Macro R² (trivially 1.0 for hard model)
+    #  Macro R² per factor
     # ──────────────────────────────────────────────────────────
     def factor_macro_r2(self) -> np.ndarray:
         """
-        Macro R² per factor.  Always 1.0 by construction (f_t ≡ Λ' m_t).
-        Provided for API compatibility with the soft GIPCA.
+        Compute R² of macro regression for each factor.
+
+        For each factor k:  R²_k = 1 - SS_res / SS_tot
+        where SS_res = Σ_t (f_kt - Λ'_k m_t)² and SS_tot = Σ_t (f_kt - mean(f_k))²
         """
         if not self._fitted:
             raise ValueError("Model must be fitted first")
-        return np.ones(self.K)
 
+        factors_arr = self.factors.values    # K × T
+        Lambda_arr = self.Lambda.values      # R × K
+
+        r2_values = np.zeros(self.K)
+        for k in range(self.K):
+            f_k = factors_arr[k, :]                    # T
+            pred_f_k = self._macro @ Lambda_arr[:, k]  # T
+
+            ss_res = np.sum((f_k - pred_f_k) ** 2)
+            ss_tot = np.sum((f_k - np.mean(f_k)) ** 2)
+            r2_values[k] = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+        return r2_values
+
+
+def generate_random_gamma(L: int, K: int, seed: int = None) -> np.ndarray:
+    """
+    Generate a random orthonormal Gamma matrix on the Grassmannian.
+
+    This function can be used to generate a shared initialization for
+    both hard_gipca (ALS) and de_gipca (DE) for fair comparison.
+
+    Parameters
+    ----------
+    L : int
+        Number of characteristics (rows).
+    K : int
+        Number of factors (columns).
+    seed : int, optional
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    Gamma : np.ndarray (L × K)
+        Orthonormal matrix with Γ'Γ = I_K.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    A = np.random.uniform(-1.0, 1.0, size=(L, K))
+    Q, _ = np.linalg.qr(A)
+    return Q[:, :K]
 
 
 def generate_gipca_data(
@@ -532,8 +688,11 @@ def generate_gipca_data(
 
         # Optional: time-varying characteristic drift
         z_drift_scale: float = 0.02,
+
+        # Identification
+        enforce_identification: bool = True,
+        ident_ridge: float = 1e-12,
 ):
-    
     """
     Generates synthetic GIPCA-like data:
       - True W_* on Grassmann (orthonormal columns) in R^{m_eff x k}
@@ -649,7 +808,7 @@ def generate_gipca_data(
 
     # ----- Generate mu_t (T, num_macro): AR(1) with correlated innovations -----
     mu = np.zeros((T, num_macro), dtype=float)
-    mu[0] = mean_mu_t[0] + rng.normal(scale=sigma_mu, size=num_macro) @ Lmu.T
+    mu[0] = mean_mu_t[0] + (rng.normal(size=num_macro) @ Lmu.T) * sigma_mu
     for t in range(1, T):
         innov = (rng.normal(size=num_macro) @ Lmu.T) * sigma_mu
         mu[t] = mean_mu_t[t] + mu_rho * (mu[t - 1] - mean_mu_t[t - 1]) + innov
@@ -659,6 +818,13 @@ def generate_gipca_data(
     f0[0] = rng.normal(scale=sigma_f0, size=k)
     for t in range(1, T):
         f0[t] = f0_rho * f0[t - 1] + rng.normal(scale=sigma_f0, size=k)
+
+    # ----- Enforce identification: f0^T mu = 0 -----
+    ident_B = None
+    if enforce_identification:
+        S_mm = mu.T @ mu + ident_ridge * np.eye(num_macro)
+        ident_B = (f0.T @ mu) @ np.linalg.inv(S_mm)  # (k, num_macro)
+        f0 = f0 - mu @ ident_B.T                       # project out mu component
 
     # ----- Cross-sectional heteroskedastic idiosyncratic scales -----
     u = rng.normal(size=N)
@@ -699,6 +865,7 @@ def generate_gipca_data(
         "mask": mask,
         "m_eff": m_eff,
         "include_intercept": include_intercept,
+        "ident_B": ident_B,
         "params": {
             "f0_rho": f0_rho,
             "sigma_f0": sigma_f0,
@@ -716,6 +883,8 @@ def generate_gipca_data(
             "missing_mode": missing_mode,
             "impute": impute,
             "z_drift_scale": z_drift_scale,
+            "enforce_identification": enforce_identification,
+            "ident_ridge": ident_ridge,
         },
     }
     return data, truth
@@ -723,103 +892,43 @@ def generate_gipca_data(
 
 
 
-# =====================================================================
-#  Test harness
-# =====================================================================
-if __name__ == "__main__":
-    print("=" * 70)
-    print("HardGIPCA (Method A) — Test Suite")
-    print("=" * 70)
+# ______________________________________________________________________________________________________________
 
-    # ── 1.  Synthetic data using generate_gipca_data  ────────
+if __name__ == '__main__':
+    import matplotlib.pyplot as plt
+
+    # Test code
     seed = 6890
     np.random.seed(seed)
+    num_assets = 40     # N
+    num_fact = 5        # k
+    num_charact = 25    # m
+    num_macro = 3       # l
+    win_len = 21        # T
+    max_iter = 2_000
 
-    num_assets = 40   # N
-    num_fact = 5      # K
-    num_charact = 25  # L
-    num_macro = 3     # R
-    win_len = 21      # T
-    max_iter = 500
+    # Generate hard data
     include_intercept = False
+    data, truth = generate_gipca_data(T=win_len, N=num_assets, m=num_charact, k=num_fact, num_macro=num_macro,
+                                 include_intercept=include_intercept, seed=seed)
 
-    # Generate synthetic GIPCA data
-    data, truth = generate_gipca_data(
-        T=win_len,
-        N=num_assets,
-        m=num_charact,
-        k=num_fact,
-        num_macro=num_macro,
-        include_intercept=include_intercept,
-        seed=seed
-    )
+    est = HardGIPCA(num_assets, num_fact, num_charact, num_macro, win_len)
+    Gamma_hat, obj_history = est.fit(data, max_iter=max_iter)
 
-    # Extract ground truth
-    true_Gamma = truth['W_star']       # m × k (called Gamma in HardGIPCA)
-    true_Delta = truth['Delta_star']   # k × num_macro
-    true_f0 = truth['f0']              # T × k
-    true_f_full = truth['f_full']      # T × k
+    print("Gamma_hat:", Gamma_hat)
+    print("Delta_hat:", est.Delta)
+    print("f0_hat shape:", est.f0.shape)
+    print("Final loss:", obj_history[-1])
 
-    # ── 2.  Fit Hard GIPCA  ──────────────────────────────────
-    print(f"\nData: T={win_len}, N={num_assets}, L={num_charact}, "
-          f"K={num_fact}, R={num_macro}")
-    print("-" * 70)
+    # Quick check of f0^T mu ~ 0
+    _, _, mu = data
+    orth = np.linalg.norm(est.f0 @ mu)
+    print("|| f0_hat^T mu ||:", orth)
 
-    model = HardGIPCA(
-        num_assets=num_assets,
-        num_fact=num_fact,
-        num_charact=num_charact,
-        num_macro=num_macro,
-        win_len=win_len,
-    )
-
-    Gamma_est, history = model.fit(data, max_iter=max_iter, tol=1e-6,
-                                   verbose=True, seed=seed)
-
-    # ── 3.  Results  ──────────────────────────────────────────
-    print("\n" + "=" * 70)
-    print("Results")
-    print("=" * 70)
-
-    results = model.get_results()
-    print(f"\nGamma shape:   {results['Gamma'].shape}")
-    print(f"Lambda shape:  {results['Lambda'].shape}")
-    print(f"Factors shape: {results['factors'].shape}")
-
-    r2 = model.score(data)
-    print(f"\nOverall R²:    {r2:.4f}")
-
-    # Subspace comparison (true W_star vs estimated Gamma)
-    Q1, _ = np.linalg.qr(true_Gamma)
-    Q2, _ = np.linalg.qr(Gamma_est)
-    _, s, _ = np.linalg.svd(Q1.T @ Q2)
-    principal_angles = np.arccos(np.clip(s, -1, 1))
-
-    print(f"\nSubspace comparison (True W_star vs Estimated Γ):")
-    print(f"  Principal angles (°): {np.round(np.degrees(principal_angles), 2)}")
-    print(f"  Grassmann distance:   {np.linalg.norm(principal_angles):.4f}")
-
-    # Factor correlation (estimated vs true full factors)
-    est_factors = results['factors'].values  # K × T
-    factor_corr = np.corrcoef(est_factors, true_f_full.T)[:num_fact, num_fact:]
-    print(f"\n|Factor correlations| with true factors:")
-    print(np.round(np.abs(factor_corr), 3))
-
-    # ── 4.  Ground truth comparison  ─────────────────────────
-    print("\n" + "=" * 70)
-    print("Ground Truth Comparison")
-    print("=" * 70)
-    print(f"\nTrue W_star (Gamma):\n{true_Gamma[:5, :]}  ... (first 5 rows)")
-    print(f"\nEstimated Gamma:\n{Gamma_est[:5, :]}  ... (first 5 rows)")
-    print(f"\nTrue Delta:\n{true_Delta}")
-    print(f"\nEstimated Lambda:\n{results['Lambda'].values}")
-
-    # ── 5.  Monotonicity check  ──────────────────────────────
-    diffs = np.diff(history)
-    n_increases = np.sum(diffs > 1e-10)
-    print(f"\nObjective monotonicity: "
-          f"{'PASS ✓' if n_increases == 0 else f'FAIL ✗ ({n_increases} increases)'}")
-
-    print("\n" + "=" * 70)
-    print("HardGIPCA test complete!")
-    print("=" * 70)
+    # Convergence history
+    plt.figure(figsize=(8, 5))
+    plt.plot(obj_history)
+    plt.title("Hard GIPCA convergence (profiled IPCA loss)")
+    plt.xlabel("Iteration")
+    plt.ylabel("Objective")
+    plt.show()
