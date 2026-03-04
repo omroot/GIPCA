@@ -136,6 +136,9 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
+# Deprecated code
+_deprecated/
+
 # macOS
 .DS_Store
 .AppleDouble
