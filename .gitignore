@@ -139,6 +139,9 @@ cython_debug/
 # Deprecated code
 _deprecated/
 
+# Run scripts
+run.command
+
 # macOS
 .DS_Store
 .AppleDouble
