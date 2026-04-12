@@ -2,6 +2,11 @@
 
 A Python implementation of **Generalized Instrumented Principal Component Analysis (GIPCA)** — an extension of IPCA (Kelly, Pruitt & Su, 2019, 2020) that incorporates macroeconomic variables to partially explain latent factors in asset pricing models.
 
+## Authors
+
+- Oualid Missaoui
+- Andrew Lesniewski
+
 ## Model
 
 Standard IPCA links asset returns to latent factors via characteristic-dependent loadings. GIPCA adds a third equation that decomposes factors into a macro-explained component and a residual:
